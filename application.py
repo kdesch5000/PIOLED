@@ -188,6 +188,22 @@ class Pi_Monitor:
         except Exception as e:
             return 0
 
+    def get_days_since_reboot(self):
+        """Get the number of days since last system reboot using uptime"""
+        try:
+            import subprocess
+            result = subprocess.run(['uptime', '-p'], capture_output=True, text=True)
+            uptime_str = result.stdout.strip()
+            # Parse "up 4 days, 5 hours, 7 minutes" format
+            if 'day' in uptime_str:
+                parts = uptime_str.split()
+                for i, part in enumerate(parts):
+                    if part.isdigit() and i + 1 < len(parts) and 'day' in parts[i + 1]:
+                        return int(part)
+            return 0  # Less than 1 day
+        except Exception:
+            return 0
+
     def cleanup(self):
         # Perform cleanup operations
         if self.cleanup_done:
@@ -244,7 +260,7 @@ class Pi_Monitor:
         max_pwm = 255
         min_pwm = 0
         oled_counter = 0  # Counter to control OLED update frequency
-        oled_screen = 0   # Which screen to show (0, 1, or 2)
+        oled_screen = 0   # Which screen to show (0, 1, 2, or 3)
         
         while not self.stop_event.is_set():
             # Fan control logic (runs every iteration - every 1 second)
@@ -279,15 +295,24 @@ class Pi_Monitor:
                     self.oled.draw_text(self._format_strings['week'].format(self.get_raspberry_weekday()), position=(0, 16), font_size=self.font_size)
                     self.oled.draw_text(self._format_strings['time'].format(self.get_raspberry_time()), position=(0, 32), font_size=self.font_size)
                     self.oled.draw_text(self._format_strings['led_mode'].format(self.get_computer_led_mode()), position=(0, 48), font_size=self.font_size)
-                else:  # oled_screen == 2
+                elif oled_screen == 2:
                     # Screen 3: Temperature/Fan
                     self.oled.draw_text(self._format_strings['pi_temp'].format(current_cpu_temp), position=(0, 0), font_size=self.font_size)
                     self.oled.draw_text(self._format_strings['pc_temp'].format(self.get_computer_temperature()), position=(0, 16), font_size=self.font_size)
                     self.oled.draw_text(self._format_strings['fan_mode'].format(self.get_computer_fan_mode()), position=(0, 32), font_size=self.font_size)
                     self.oled.draw_text(self._format_strings['fan_duty'].format(int(float(self.get_computer_fan_duty()/255.0)*100)), position=(0, 48), font_size=self.font_size)
+                else:  # oled_screen == 3
+                    # Screen 4: Days since reboot with large bold numbers
+                    days = self.get_days_since_reboot()
+                    self.oled.draw_text("Days since reboot:", position=(0, 0), font_size=10)
+                    # Draw large day number - use larger font and center it
+                    day_str = str(days)
+                    self.oled.draw_text(day_str, position=(40, 25), font_size=24)
+                    # Add "days" label below
+                    self.oled.draw_text("days" if days != 1 else "day", position=(45, 50), font_size=10)
                 
                 self.oled.show()
-                oled_screen = (oled_screen + 1) % 3  # Cycle through screens 0, 1, 2
+                oled_screen = (oled_screen + 1) % 4  # Cycle through screens 0, 1, 2, 3
             
             oled_counter += 1
             time.sleep(1)  # Base interval of 1 second
