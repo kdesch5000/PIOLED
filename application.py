@@ -15,13 +15,18 @@ import atexit
 import signal
 import threading
 import datetime
+import subprocess
+import syslog
+from pathlib import Path
 
 from oled import OLED
 from expansion import Expansion
 
 class Pi_Monitor:
     __slots__ = ['oled', 'expansion', 'font_size', 'cleanup_done', 
-                 'stop_event', '_fan_pwm_path', '_format_strings']
+                 'stop_event', '_fan_pwm_path', '_format_strings', 
+                 'hdmi_on', 'hdmi_timeout', 'last_activity', 
+                 'motion_thread', 'capture_dir', 'frame_count', 'motion_sensitivity', 'last_motion_log_time']
 
     def __init__(self):
         # Initialize OLED and Expansion objects
@@ -33,6 +38,24 @@ class Pi_Monitor:
         
         # Cache hwmon path lookup for performance
         self._fan_pwm_path = None
+        
+        # HDMI display wake-up configuration (OLED stays always on)
+        self.hdmi_on = False
+        self.hdmi_timeout = 60  # 60 seconds timeout
+        self.last_activity = time.time()
+        
+        # Camera motion detection configuration
+        self.motion_thread = None
+        self.capture_dir = "/tmp/motion_frames"
+        self.frame_count = 0
+        self.motion_sensitivity = 30
+        self.last_motion_log_time = 0
+        
+        # Initialize syslog for motion detection events
+        syslog.openlog("PiMonitorMotion", syslog.LOG_PID, syslog.LOG_DAEMON)
+        
+        # Create capture directory
+        Path(self.capture_dir).mkdir(exist_ok=True)
         
         # Pre-allocate format strings
         self._format_strings = {
@@ -68,6 +91,9 @@ class Pi_Monitor:
         
         # Initialize fan PWM path cache
         self._find_fan_pwm_path()
+        
+        # Initialize camera motion detection
+        self._start_motion_detection()
 
     def _find_fan_pwm_path(self):
         """Cache the fan PWM path to avoid repeated directory lookups"""
@@ -191,7 +217,6 @@ class Pi_Monitor:
     def get_days_since_reboot(self):
         """Get the number of days since last system reboot using uptime"""
         try:
-            import subprocess
             result = subprocess.run(['uptime', '-p'], capture_output=True, text=True)
             uptime_str = result.stdout.strip()
             # Parse "up 4 days, 5 hours, 7 minutes" format
@@ -204,11 +229,218 @@ class Pi_Monitor:
         except Exception:
             return 0
 
+    def _start_motion_detection(self):
+        """Start camera motion detection thread"""
+        self.motion_thread = threading.Thread(target=self._camera_motion_loop, daemon=True)
+        self.motion_thread.start()
+        print("Camera motion detection started")
+        
+        # Log startup to syslog
+        timestamp = datetime.datetime.now()
+        syslog.syslog(syslog.LOG_INFO, f"Camera motion detection started at {timestamp.strftime('%Y-%m-%d %H:%M:%S')} - Sensitivity: {self.motion_sensitivity}, Timeout: {self.hdmi_timeout}s")
+
+    def _camera_motion_loop(self):
+        """Main camera motion detection loop"""
+        try:
+            while not self.stop_event.is_set():
+                current_frame = f"{self.capture_dir}/frame_{self.frame_count % 2}.jpg"
+                previous_frame = f"{self.capture_dir}/frame_{(self.frame_count + 1) % 2}.jpg"
+                
+                # Capture current frame
+                if self._capture_frame(current_frame):
+                    # Check for motion if we have a previous frame
+                    if self.frame_count > 0 and os.path.exists(previous_frame):
+                        if self._detect_motion(current_frame, previous_frame):
+                            self._wake_hdmi_display()
+                            
+                    self.frame_count += 1
+                    
+                    # Cleanup old frames periodically
+                    if self.frame_count % 20 == 0:
+                        self._cleanup_old_frames()
+                else:
+                    time.sleep(1)  # Wait before retrying if capture failed
+                    
+                time.sleep(0.5)  # Small delay between captures
+                
+        except Exception as e:
+            print(f"Camera motion detection error: {e}")
+            syslog.syslog(syslog.LOG_ERR, f"Camera motion detection error: {e}")
+            
+    def _capture_frame(self, filename):
+        """Capture a single frame using rpicam-still"""
+        try:
+            cmd = [
+                'rpicam-still',
+                '--timeout', '100',  # Very quick capture
+                '--width', '640',
+                '--height', '480',
+                '--nopreview',
+                '--output', filename
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            return result.returncode == 0
+        except Exception:
+            return False
+            
+    def _detect_motion(self, current_frame, previous_frame):
+        """Detect motion between two frames using basic comparison"""
+        try:
+            if not os.path.exists(current_frame) or not os.path.exists(previous_frame):
+                return False
+                
+            # Get file sizes as a basic comparison
+            size1 = os.path.getsize(previous_frame)
+            size2 = os.path.getsize(current_frame)
+            
+            if size1 == 0:
+                return False
+                
+            # Calculate percentage difference
+            diff_percent = abs(size1 - size2) / size1 * 100
+            
+            # If file sizes differ significantly, assume motion
+            return diff_percent > (self.motion_sensitivity / 10)
+            
+        except Exception:
+            return False
+            
+    def _cleanup_old_frames(self):
+        """Keep only the last 2 frames to save space"""
+        try:
+            files = list(Path(self.capture_dir).glob("frame_*.jpg"))
+            if len(files) > 2:
+                files.sort(key=lambda x: x.stat().st_mtime)
+                for f in files[:-2]:
+                    f.unlink()
+        except Exception:
+            pass
+
+    def _wake_hdmi_display(self):
+        """Wake up DSI display using multiple methods"""
+        if not self.hdmi_on:
+            timestamp = datetime.datetime.now()
+            print(f"[{timestamp.strftime('%H:%M:%S')}] MOTION DETECTED! Waking DSI display...")
+            
+            # Log motion detection to syslog
+            syslog.syslog(syslog.LOG_INFO, f"Motion detected at {timestamp.strftime('%Y-%m-%d %H:%M:%S')} - DSI display activated")
+            
+            self.hdmi_on = True
+            self._set_hdmi_power(True)
+        else:
+            timestamp = datetime.datetime.now()
+            print(f"[{timestamp.strftime('%H:%M:%S')}] Motion detected (display already on)")
+            
+            # Log continued motion to syslog (less verbose - only every 10 seconds)
+            if (time.time() - self.last_motion_log_time) >= 10:
+                syslog.syslog(syslog.LOG_DEBUG, f"Continued motion detected at {timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+                self.last_motion_log_time = time.time()
+            
+        self.last_activity = time.time()
+
+    def _set_hdmi_power(self, power_on):
+        """Control DSI display power using multiple methods"""
+        try:
+            # Set environment for X11 commands
+            env = os.environ.copy()
+            env['DISPLAY'] = ':0'
+            
+            if power_on:
+                # Try multiple methods to turn on DSI display
+                methods = [
+                    (['xset', 'dpms', 'force', 'on'], "xset", env),
+                    (['xrandr', '--output', 'DSI-1', '--auto'], "xrandr", env),
+                    (['vcgencmd', 'display_power', '1'], "vcgencmd", None),
+                    (['tvservice', '-p'], "tvservice", None)
+                ]
+                
+                success = False
+                for cmd, name, cmd_env in methods:
+                    try:
+                        result = subprocess.run(cmd, capture_output=True, timeout=5, env=cmd_env or os.environ)
+                        if result.returncode == 0:
+                            print(f"DSI display powered ON via {name}")
+                            success = True
+                            break
+                    except Exception as e:
+                        print(f"Method {name} failed: {e}")
+                        continue
+                        
+                if not success:
+                    print("DSI display power on - all methods failed")
+            else:
+                # Try multiple methods to turn off display
+                methods = [
+                    (['xset', 'dpms', 'force', 'off'], "xset", env),
+                    (['xrandr', '--output', 'DSI-1', '--off'], "xrandr", env),
+                    (['vcgencmd', 'display_power', '0'], "vcgencmd", None),
+                    (['tvservice', '-o'], "tvservice", None)
+                ]
+                
+                success = False
+                for cmd, name, cmd_env in methods:
+                    try:
+                        result = subprocess.run(cmd, capture_output=True, timeout=5, env=cmd_env or os.environ)
+                        if result.returncode == 0:
+                            print(f"DSI display powered OFF via {name}")
+                            success = True
+                            break
+                    except Exception as e:
+                        print(f"Method {name} failed: {e}")
+                        continue
+                
+                if not success:
+                    print("DSI display power off - all methods failed")
+                    
+        except Exception as e:
+            print(f"DSI display power control error: {e}")
+
+    def _check_hdmi_timeout(self):
+        """Check if DSI display should be turned off due to inactivity"""
+        if self.hdmi_on and self.last_activity > 0:
+            if (time.time() - self.last_activity) > self.hdmi_timeout:
+                timestamp = datetime.datetime.now()
+                print(f"[{timestamp.strftime('%H:%M:%S')}] No motion for {self.hdmi_timeout}s, turning off DSI display...")
+                
+                # Log DSI display timeout to syslog
+                syslog.syslog(syslog.LOG_INFO, f"No motion detected for {self.hdmi_timeout}s at {timestamp.strftime('%Y-%m-%d %H:%M:%S')} - DSI display deactivated")
+                
+                self.hdmi_on = False
+                self._set_hdmi_power(False)
+
     def cleanup(self):
         # Perform cleanup operations
         if self.cleanup_done:
             return
         self.cleanup_done = True
+        try:
+            # Stop motion detection thread
+            if hasattr(self, 'motion_thread') and self.motion_thread and self.motion_thread.is_alive():
+                self.stop_event.set()
+                self.motion_thread.join(timeout=2)
+        except Exception as e:
+            pass
+            
+        # Log shutdown to syslog
+        try:
+            timestamp = datetime.datetime.now()
+            syslog.syslog(syslog.LOG_INFO, f"Motion detector shutting down at {timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+        except Exception:
+            pass
+        
+        # Clean up captured frames
+        try:
+            if hasattr(self, 'capture_dir'):
+                for f in Path(self.capture_dir).glob("frame_*.jpg"):
+                    f.unlink()
+        except Exception:
+            pass
+        
+        # Close syslog
+        try:
+            syslog.closelog()
+        except Exception:
+            pass
         try:
             if self.oled:
                 self.oled.close()
@@ -263,12 +495,15 @@ class Pi_Monitor:
         oled_screen = 0   # Which screen to show (0, 1, 2, or 3)
         
         while not self.stop_event.is_set():
+            # Check HDMI display timeout (runs every iteration)
+            self._check_hdmi_timeout()
+            
             # Fan control logic (runs every iteration - every 1 second)
             current_cpu_temp = self.get_raspberry_cpu_temperature()
             current_fan_pwm = self.get_raspberry_fan_pwm()
             
             # Use single print statement to reduce I/O
-            print(f"CPU TEMP: {current_cpu_temp}C, FAN PWM: {current_fan_pwm}")
+            print(f"CPU TEMP: {current_cpu_temp}C, FAN PWM: {current_fan_pwm}, HDMI: {'ON' if self.hdmi_on else 'OFF'}")
             
             if current_fan_pwm != -1:
                 if last_fan_pwm_limit == 0 and current_fan_pwm > temp_threshold_high:
@@ -280,7 +515,7 @@ class Pi_Monitor:
                     self.expansion.set_fan_duty(last_fan_pwm, last_fan_pwm)
                     last_fan_pwm_limit = 0
             
-            # OLED update logic (runs every 3 seconds)
+            # OLED update logic (runs every 3 seconds, always on)
             if oled_counter % 3 == 0:
                 self.oled.clear()
                 if oled_screen == 0:
@@ -304,10 +539,10 @@ class Pi_Monitor:
                 else:  # oled_screen == 3
                     # Screen 4: Days since reboot with large bold numbers
                     days = self.get_days_since_reboot()
-                    self.oled.draw_text("Days since reboot:", position=(0, 0), font_size=10)
+                    self.oled.draw_text("Days Since:", position=(0, 0), font_size=14)
                     # Draw large day number - use larger font and center it
                     day_str = str(days)
-                    self.oled.draw_text(day_str, position=(40, 25), font_size=24)
+                    self.oled.draw_text(day_str, position=(40, 25), font_size=40)
                     # Add "days" label below
                     self.oled.draw_text("days" if days != 1 else "day", position=(45, 50), font_size=10)
                 
