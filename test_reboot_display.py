@@ -42,11 +42,11 @@ def main():
         oled.clear()
         
         # Display the reboot information
-        oled.draw_text("Days since reboot:", position=(0, 0), font_size=10)
+        oled.draw_text("Days Since:", position=(0, 0), font_size=14)
         
         # Draw large day number - use larger font and center it
         day_str = str(days)
-        oled.draw_text(day_str, position=(40, 25), font_size=24)
+        oled.draw_text(day_str, position=(40, 25), font_size=40)
         
         # Add "days" label below
         label = "days" if days != 1 else "day"
