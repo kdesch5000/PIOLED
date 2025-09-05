@@ -1,4 +1,4 @@
-# Application.py Modifications - Aug 29, 2025
+# Application.py Modifications - Sep 5, 2025
 
 ## Original Issue
 - Raspberry Pi monitoring application with OLED display and RGB LEDs
@@ -74,13 +74,20 @@
 - Uptime display with "days since reboot" screen
 - Comprehensive error handling and logging
 
+### Logging Optimizations (Sep 5, 2025)
+- **Motion Detection Rate Limiting**: PIR and camera motion logging limited to once every 30 seconds
+- **Reduced Console Verbosity**: Eliminated repetitive motion detection console messages
+- **Simplified Syslog Messages**: Streamlined log entries without redundant timestamps
+- **Smart Motion End Logging**: Only logs PIR motion end events for durations > 5 seconds
+- **Display Event Optimization**: Simplified display wake/sleep logging without verbose details
+
 ### Syslog Integration
-- **PIR Motion Events**: PIR sensor motion detection and duration logging
-- **Camera Motion Events**: Camera motion detection when used as fallback
+- **PIR Motion Events**: PIR sensor motion detection with 30-second rate limiting
+- **Camera Motion Events**: Camera motion detection with 30-second rate limiting (fallback mode)
 - **Motion Source Tracking**: Clear identification of PIR vs Camera in logs
 - **LED System Events**: LED indicator initialization and status
 - **Startup/Shutdown Events**: Application lifecycle tracking
-- **Debug Logging**: Continued motion detection and system status
+- **Reduced Verbosity**: Motion logging limited to significant events and periodic updates
 
 ## Key Benefits
 - **Dual Motion Detection**: PIR sensor primary + camera fallback for maximum reliability

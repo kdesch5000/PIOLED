@@ -37,7 +37,7 @@ class Pi_Monitor:
                  'stop_event', '_fan_pwm_path', '_format_strings',
                  'hdmi_on', 'hdmi_timeout', 'last_activity',
                  'motion_thread', 'capture_dir', 'frame_count', 'motion_sensitivity', 'last_motion_log_time',
-                 'last_disk_activity', 'last_disk_bytes', 'pir_pin', 'pir_available', 'pir_initialized', 'use_camera_fallback']
+                 'last_disk_activity', 'last_disk_bytes', 'pir_pin', 'pir_available', 'pir_initialized', 'use_camera_fallback', 'last_pir_log_time']
 
     def __init__(self):
         # Initialize OLED and Expansion objects
@@ -69,6 +69,7 @@ class Pi_Monitor:
         self.motion_sensitivity = 30
         self.last_motion_log_time = 0
         self.use_camera_fallback = False
+        self.last_pir_log_time = 0  # Rate limit PIR logging
 
         # Disk activity tracking for LED indicator
         self.last_disk_activity = time.time()
@@ -496,18 +497,21 @@ class Pi_Monitor:
                 timestamp = datetime.datetime.now()
                 
                 if current_state and not last_state:
-                    # Motion started
+                    # Motion started - only log every 30 seconds to reduce verbosity
                     motion_start_time = current_time
-                    print(f"[{timestamp.strftime('%H:%M:%S')}] PIR MOTION DETECTED! Waking display...")
-                    syslog.syslog(syslog.LOG_INFO, f"PIR motion detected at {timestamp.strftime('%Y-%m-%d %H:%M:%S')} - Display activated")
+                    if (current_time - self.last_pir_log_time) >= 30:
+                        print(f"[{timestamp.strftime('%H:%M:%S')}] PIR motion detected")
+                        syslog.syslog(syslog.LOG_INFO, f"PIR motion detected at {timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+                        self.last_pir_log_time = current_time
                     self._wake_hdmi_display()
                 
                 elif not current_state and last_state:
-                    # Motion ended
+                    # Motion ended - reduce logging verbosity
                     if motion_start_time > 0:
                         duration = current_time - motion_start_time
-                        print(f"[{timestamp.strftime('%H:%M:%S')}] PIR motion ended (duration: {duration:.1f}s)")
-                        syslog.syslog(syslog.LOG_DEBUG, f"PIR motion ended at {timestamp.strftime('%Y-%m-%d %H:%M:%S')} - duration: {duration:.1f}s")
+                        # Only log motion end for longer durations (> 5 seconds)
+                        if duration > 5:
+                            syslog.syslog(syslog.LOG_DEBUG, f"PIR motion ended - duration: {duration:.1f}s")
                 
                 last_state = current_state
                 time.sleep(0.2)  # Check every 200ms
@@ -537,6 +541,13 @@ class Pi_Monitor:
                     # Check for motion if we have a previous frame
                     if self.frame_count > 0 and os.path.exists(previous_frame):
                         if self._detect_motion(current_frame, previous_frame):
+                            # Rate limit camera motion logging
+                            current_time = time.time()
+                            if (current_time - self.last_motion_log_time) >= 30:
+                                timestamp = datetime.datetime.now()
+                                print(f"[{timestamp.strftime('%H:%M:%S')}] Camera motion detected")
+                                syslog.syslog(syslog.LOG_INFO, f"Camera motion detected at {timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+                                self.last_motion_log_time = current_time
                             self._wake_hdmi_display()
 
                     self.frame_count += 1
@@ -610,22 +621,11 @@ class Pi_Monitor:
         threading.Thread(target=self.blink_motion_indicator, daemon=True).start()
         
         if not self.hdmi_on:
-            timestamp = datetime.datetime.now()
-            print(f"[{timestamp.strftime('%H:%M:%S')}] {motion_source} MOTION DETECTED! Waking DSI display...")
-
-            # Log motion detection to syslog
-            syslog.syslog(syslog.LOG_INFO, f"{motion_source} motion detected at {timestamp.strftime('%Y-%m-%d %H:%M:%S')} - DSI display activated")
-
+            # Only log display wake events, not every motion detection
+            syslog.syslog(syslog.LOG_INFO, f"Display activated by {motion_source} motion")
             self.hdmi_on = True
             self._set_hdmi_power(True)
-        else:
-            timestamp = datetime.datetime.now()
-            print(f"[{timestamp.strftime('%H:%M:%S')}] {motion_source} motion detected (display already on)")
-
-            # Log continued motion to syslog (less verbose - only every 10 seconds)
-            if (time.time() - self.last_motion_log_time) >= 10:
-                syslog.syslog(syslog.LOG_DEBUG, f"Continued {motion_source} motion detected at {timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
-                self.last_motion_log_time = time.time()
+        # Remove logging for continued motion when display is already on
 
         self.last_activity = time.time()
 
@@ -692,12 +692,8 @@ class Pi_Monitor:
         """Check if DSI display should be turned off due to inactivity"""
         if self.hdmi_on and self.last_activity > 0:
             if (time.time() - self.last_activity) > self.hdmi_timeout:
-                timestamp = datetime.datetime.now()
-                print(f"[{timestamp.strftime('%H:%M:%S')}] No motion for {self.hdmi_timeout}s, turning off DSI display...")
-
-                # Log DSI display timeout to syslog
-                syslog.syslog(syslog.LOG_INFO, f"No motion detected for {self.hdmi_timeout}s at {timestamp.strftime('%Y-%m-%d %H:%M:%S')} - DSI display deactivated")
-
+                # Reduced verbosity - just log the timeout event
+                syslog.syslog(syslog.LOG_INFO, f"Display deactivated after {self.hdmi_timeout}s timeout")
                 self.hdmi_on = False
                 self._set_hdmi_power(False)
 
@@ -818,8 +814,8 @@ class Pi_Monitor:
             self.update_disk_activity_led(current_disk_usage, disk_activity)
             self.update_system_health_led(current_cpu_temp, current_cpu_usage, current_mem_usage, current_disk_usage)
 
-            # Enhanced status output including all metrics
-            print(f"TEMP: {current_cpu_temp:.1f}°C, CPU: {current_cpu_usage:.1f}%, MEM: {current_mem_usage:.1f}%, DISK: {current_disk_usage:.1f}%, FAN: {current_fan_pwm}, HDMI: {'ON' if self.hdmi_on else 'OFF'}")
+            # Enhanced status output including all metrics (commented out to reduce log verbosity)
+            # print(f"TEMP: {current_cpu_temp:.1f}°C, CPU: {current_cpu_usage:.1f}%, MEM: {current_mem_usage:.1f}%, DISK: {current_disk_usage:.1f}%, FAN: {current_fan_pwm}, HDMI: {'ON' if self.hdmi_on else 'OFF'}")
 
             # FIXED: Compare current_cpu_temp instead of current_fan_pwm against temperature thresholds
             if current_fan_pwm != -1:  # Only proceed if we can read fan PWM
