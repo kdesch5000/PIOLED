@@ -309,13 +309,22 @@ class Pi_Monitor:
         try:
             result = subprocess.run(['uptime', '-p'], capture_output=True, text=True)
             uptime_str = result.stdout.strip()
-            # Parse "up 4 days, 5 hours, 7 minutes" format
-            if 'day' in uptime_str:
-                parts = uptime_str.split()
-                for i, part in enumerate(parts):
-                    if part.isdigit() and i + 1 < len(parts) and 'day' in parts[i + 1]:
-                        return int(part)
-            return 0  # Less than 1 day
+            # Parse "up X weeks, Y days, Z hours, W minutes" format
+            total_days = 0
+            parts = uptime_str.split()
+            
+            for i, part in enumerate(parts):
+                if part.isdigit():
+                    value = int(part)
+                    # Check the next part for time unit
+                    if i + 1 < len(parts):
+                        unit = parts[i + 1].rstrip(',')
+                        if 'week' in unit:
+                            total_days += value * 7
+                        elif 'day' in unit:
+                            total_days += value
+            
+            return total_days
         except Exception:
             return 0
 
@@ -855,11 +864,12 @@ class Pi_Monitor:
                     # Screen 4: Days since reboot with large bold numbers
                     days = self.get_days_since_reboot()
                     self.oled.draw_text("Days Since:", position=(0, 0), font_size=14)
-                    # Draw large day number - use larger font and center it
+                    # Draw large day number - dynamically center based on digit count
                     day_str = str(days)
-                    self.oled.draw_text(day_str, position=(40, 25), font_size=40)
-                    # Add "days" label below
-                    self.oled.draw_text("days" if days != 1 else "day", position=(45, 50), font_size=10)
+                    # Calculate x position to center the text (approx 24 pixels per digit at font size 40)
+                    text_width = len(day_str) * 24
+                    x_pos = max(0, (128 - text_width) // 2)  # Center on 128px wide display
+                    self.oled.draw_text(day_str, position=(x_pos, 15), font_size=40)
 
                 self.oled.show()
                 oled_screen = (oled_screen + 1) % 4  # Cycle through screens 0, 1, 2, 3
